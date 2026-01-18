@@ -51,7 +51,6 @@ class MainActivity : ComponentActivity() {
                 // 按照官方库链接逻辑加载
                 System.loadLibrary("MNN")
                 System.loadLibrary("MNN_Express")
-                // 既然只用 OpenGL，我们不再显式加载 Vulkan 库，减少驱动冲突
                 System.loadLibrary("sd_engine")
                 Log.i("SAFlow_JNI", "Native Libraries Loaded Successfully")
             } catch (e: Exception) {
@@ -64,10 +63,24 @@ class MainActivity : ComponentActivity() {
     private val crashFile by lazy { File(cacheDir, "crash_log.txt") }
     private val viewModel: MainViewModel by viewModels()
 
+    // 新增：文件选择器，用于选择新的 .mnn 文件
+    private val modelPickerLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) {
+            viewModel.replaceModelFile(uri, cacheDir) { success ->
+                if (success) {
+                    // 替换成功后，在 IO 线程重新加载引擎
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        reloadEngine()
+                    }
+                }
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 全局崩溃捕获（参考官方 CrashUtil 思路）
+        // 全局崩溃捕获
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             handleCrash(throwable)
         }
@@ -85,9 +98,31 @@ class MainActivity : ComponentActivity() {
                 ) {
                     StyleTransferScreen(
                         viewModel = viewModel,
-                        onGenerate = { styleId -> runGeneration(styleId) }
+                        onGenerate = { styleId -> runGeneration(styleId) },
+                        // 新增：点击上传按钮的回调
+                        onUploadModel = {
+                            // 启动文件选择器，过滤任意类型或指定 application/octet-stream
+                            modelPickerLauncher.launch("*/*")
+                        }
                     )
                 }
+            }
+        }
+    }
+
+    // 新增：重新加载引擎的方法
+    private suspend fun reloadEngine() {
+        viewModel.isEngineReady = false
+        // C++ 层的 initEngine 会 delete 旧指针并 new 新对象，读取最新的 Flow.mnn
+        val success = initEngine(cacheDir.absolutePath)
+
+        withContext(Dispatchers.Main) {
+            viewModel.setProcessing(false) // 解锁 UI
+            if (success) {
+                viewModel.isEngineReady = true
+                viewModel.updateStatus("新模型加载成功!")
+            } else {
+                viewModel.updateStatus("新模型加载失败 (JNI Error)")
             }
         }
     }
@@ -118,13 +153,13 @@ class MainActivity : ComponentActivity() {
         }
 
         viewModel.setProcessing(true)
-        viewModel.updateStatus("生成中 (OpenGL)...") // 已修改为 OpenGL
+        viewModel.updateStatus("生成中 (OpenGL)...")
 
         lifecycleScope.launch(Dispatchers.Default) {
             try {
                 val w = 512
                 val h = 512
-                // 确保使用 ARGB_8888 适配 MNN ImageProcess [cite: 6]
+                // 确保使用 ARGB_8888 适配 MNN ImageProcess
                 val output = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
 
                 if (input.isRecycled) throw RuntimeException("Input Bitmap is recycled!")
@@ -159,7 +194,11 @@ class MainActivity : ComponentActivity() {
             val modelFiles = listOf("Encoder.mnn", "Flow.mnn", "Decoder.mnn")
             for (fileName in modelFiles) {
                 val outFile = File(cacheDir, fileName)
-                copyAssetResource(fileName, outFile)
+                // 只有文件不存在时才拷贝，避免覆盖用户上传的自定义 Flow.mnn
+                // 如果你想每次启动都重置为默认，去掉 !outFile.exists() 判断即可
+                if (!outFile.exists()) {
+                    copyAssetResource(fileName, outFile)
+                }
             }
 
             // 初始化 Native 引擎
@@ -167,7 +206,7 @@ class MainActivity : ComponentActivity() {
             withContext(Dispatchers.Main) {
                 if (success) {
                     viewModel.isEngineReady = true
-                    viewModel.updateStatus("引擎就绪 (Honor 8 Elite OpenGL)")
+                    viewModel.updateStatus("引擎就绪 (Snapdragon 8 Elite OpenGL)")
                 } else {
                     viewModel.updateStatus("OpenGL 初始化失败")
                 }
@@ -198,7 +237,8 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun StyleTransferScreen(
     viewModel: MainViewModel,
-    onGenerate: (Int) -> Unit
+    onGenerate: (Int) -> Unit,
+    onUploadModel: () -> Unit // 新增参数
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val photoPicker = rememberLauncherForActivityResult(
@@ -216,7 +256,7 @@ fun StyleTransferScreen(
 
         item {
             Text("MNN Style Transfer", fontSize = 22.sp, fontWeight = FontWeight.Bold)
-            Text("Adreno GPU (OpenGL ES 3.0)", fontSize = 12.sp, color = Color.Gray) // 修改 UI 描述
+            Text("Adreno GPU (OpenGL ES 3.0)", fontSize = 12.sp, color = Color.Gray)
             Spacer(modifier = Modifier.height(12.dp))
         }
 
@@ -268,8 +308,21 @@ fun StyleTransferScreen(
                     )
                 ) { Text("Photo") }
             }
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(16.dp))
         }
+
+        // === 新增：上传自定义模型按钮 ===
+        item {
+            OutlinedButton(
+                onClick = onUploadModel,
+                enabled = !uiState.isProcessing,
+                modifier = Modifier.fillMaxWidth().height(50.dp)
+            ) {
+                Text("Upload Custom Flow.mnn")
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+        // ============================
 
         item {
             Button(
