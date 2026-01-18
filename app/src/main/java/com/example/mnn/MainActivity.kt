@@ -41,20 +41,19 @@ import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
-    // Native 方法声明
+    // Native 方法：注意增加了 steps 参数
     external fun initEngine(cacheDir: String): Boolean
-    external fun runStyleTransfer(src: Bitmap, dst: Bitmap, styleId: Int): Boolean
+    external fun runStyleTransfer(src: Bitmap, dst: Bitmap, styleId: Int, steps: Int): Boolean
 
     companion object {
         init {
             try {
-                // 按照官方库链接逻辑加载
                 System.loadLibrary("MNN")
                 System.loadLibrary("MNN_Express")
-                System.loadLibrary("sd_engine")
-                Log.i("SAFlow_JNI", "Native Libraries Loaded Successfully")
+                System.loadLibrary("sd_engine") // 你的 C++ 库名
+                Log.i("SAFlow", "Libraries Loaded")
             } catch (e: Exception) {
-                Log.e("SAFlow_JNI", "Native Lib Load Failed: ${e.message}")
+                Log.e("SAFlow", "Lib Load Failed: ${e.message}")
             }
         }
     }
@@ -63,12 +62,12 @@ class MainActivity : ComponentActivity() {
     private val crashFile by lazy { File(cacheDir, "crash_log.txt") }
     private val viewModel: MainViewModel by viewModels()
 
-    // 新增：文件选择器，用于选择新的 .mnn 文件
+    // 模型文件选择器
     private val modelPickerLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) {
             viewModel.replaceModelFile(uri, cacheDir) { success ->
                 if (success) {
-                    // 替换成功后，在 IO 线程重新加载引擎
+                    // 文件替换成功，重新初始化 Native 引擎
                     lifecycleScope.launch(Dispatchers.IO) {
                         reloadEngine()
                     }
@@ -80,12 +79,12 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 全局崩溃捕获
-        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+        // 崩溃捕获
+        Thread.setDefaultUncaughtExceptionHandler { _, throwable ->
             handleCrash(throwable)
         }
 
-        // 异步初始化资源
+        // 初始化资源
         lifecycleScope.launch(Dispatchers.IO) {
             prepareModelsAndEngine()
         }
@@ -99,9 +98,8 @@ class MainActivity : ComponentActivity() {
                     StyleTransferScreen(
                         viewModel = viewModel,
                         onGenerate = { styleId -> runGeneration(styleId) },
-                        // 新增：点击上传按钮的回调
                         onUploadModel = {
-                            // 启动文件选择器，过滤任意类型或指定 application/octet-stream
+                            // 启动文件选择器，MNN文件通常识别为 octet-stream 或任意类型
                             modelPickerLauncher.launch("*/*")
                         }
                     )
@@ -110,19 +108,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // 新增：重新加载引擎的方法
+    // 重载引擎 (用于模型上传后)
     private suspend fun reloadEngine() {
         viewModel.isEngineReady = false
-        // C++ 层的 initEngine 会 delete 旧指针并 new 新对象，读取最新的 Flow.mnn
         val success = initEngine(cacheDir.absolutePath)
 
         withContext(Dispatchers.Main) {
             viewModel.setProcessing(false) // 解锁 UI
             if (success) {
                 viewModel.isEngineReady = true
-                viewModel.updateStatus("新模型加载成功!")
+                viewModel.updateStatus("新模型已加载 (CPU Mode)")
             } else {
-                viewModel.updateStatus("新模型加载失败 (JNI Error)")
+                viewModel.updateStatus("模型加载失败 (JNI Error)")
             }
         }
     }
@@ -133,13 +130,9 @@ class MainActivity : ComponentActivity() {
             e.printStackTrace(PrintWriter(sw))
             val stackTrace = sw.toString()
             val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
-            val report = "\n[$time] CRASH REPORT:\n$stackTrace\n"
-
-            FileOutputStream(crashFile, true).use { it.write(report.toByteArray()) }
-            writeLog("APP CRASHED! See crash_log.txt")
-        } catch (ex: Exception) {
-            Log.e("SAFlow_Crash", "Failed to write crash log")
-        } finally {
+            FileOutputStream(crashFile, true).use { it.write("\n[$time] CRASH:\n$stackTrace\n".toByteArray()) }
+        } catch (_: Exception) {}
+        finally {
             android.os.Process.killProcess(android.os.Process.myPid())
             System.exit(1)
         }
@@ -152,20 +145,18 @@ class MainActivity : ComponentActivity() {
             return
         }
 
+        val steps = viewModel.uiState.value.steps
         viewModel.setProcessing(true)
-        viewModel.updateStatus("生成中 (OpenGL)...")
+        viewModel.updateStatus("生成中 (CPU: $steps 步)...")
 
         lifecycleScope.launch(Dispatchers.Default) {
             try {
-                val w = 512
-                val h = 512
-                // 确保使用 ARGB_8888 适配 MNN ImageProcess
-                val output = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-
-                if (input.isRecycled) throw RuntimeException("Input Bitmap is recycled!")
+                val output = Bitmap.createBitmap(512, 512, Bitmap.Config.ARGB_8888)
+                if (input.isRecycled) throw RuntimeException("Bitmap recycled")
 
                 val start = System.currentTimeMillis()
-                val success = runStyleTransfer(input, output, styleId)
+                // 调用 Native，传入 steps
+                val success = runStyleTransfer(input, output, styleId, steps)
                 val cost = System.currentTimeMillis() - start
 
                 withContext(Dispatchers.Main) {
@@ -174,71 +165,58 @@ class MainActivity : ComponentActivity() {
                         viewModel.setResult(output)
                         viewModel.updateStatus("完成! 耗时: ${cost}ms")
                     } else {
-                        viewModel.updateStatus("生成失败 (后端回退)")
+                        viewModel.updateStatus("生成失败")
                     }
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     viewModel.setProcessing(false)
-                    viewModel.updateStatus("Err: ${e.message}")
-                    writeLog("Logic Error: ${e.message}")
+                    viewModel.updateStatus("错误: ${e.message}")
                 }
             }
         }
     }
 
     private suspend fun prepareModelsAndEngine() {
-        writeLog("Preparing Engine...")
+        writeLog("Starting Init...")
         try {
-            // 拷贝 Asset 模型文件
             val modelFiles = listOf("Encoder.mnn", "Flow.mnn", "Decoder.mnn")
             for (fileName in modelFiles) {
                 val outFile = File(cacheDir, fileName)
-                // 只有文件不存在时才拷贝，避免覆盖用户上传的自定义 Flow.mnn
-                // 如果你想每次启动都重置为默认，去掉 !outFile.exists() 判断即可
+                // 如果文件不存在则从 assets 拷贝；若已存在(可能是用户上传的)则保留
                 if (!outFile.exists()) {
-                    copyAssetResource(fileName, outFile)
+                    assets.open(fileName).use { input ->
+                        FileOutputStream(outFile).use { output -> input.copyTo(output) }
+                    }
                 }
             }
 
-            // 初始化 Native 引擎
             val success = initEngine(cacheDir.absolutePath)
             withContext(Dispatchers.Main) {
                 if (success) {
                     viewModel.isEngineReady = true
-                    viewModel.updateStatus("引擎就绪 (Snapdragon 8 Elite OpenGL)")
+                    viewModel.updateStatus("引擎就绪 (CPU FP16)")
                 } else {
-                    viewModel.updateStatus("OpenGL 初始化失败")
+                    viewModel.updateStatus("初始化失败")
                 }
             }
         } catch (e: Throwable) {
-            writeLog("Initialization Error: ${e.message}")
+            writeLog("Init Error: ${e.message}")
         }
     }
 
     private fun writeLog(msg: String) {
-        try { FileOutputStream(logFile, true).use { it.write("[Java] $msg\n".toByteArray()) } } catch (e: Exception) {}
-    }
-
-    private fun copyAssetResource(assetName: String, outFile: File): Boolean {
-        return try {
-            assets.open(assetName).use { input ->
-                FileOutputStream(outFile).use { output -> input.copyTo(output) }
-            }
-            true
-        } catch (e: Exception) { false }
+        try { FileOutputStream(logFile, true).use { it.write("$msg\n".toByteArray()) } } catch (_: Exception) {}
     }
 }
 
-// ==========================================
-// UI 部分
-// ==========================================
+// ================= UI 组件 =================
 
 @Composable
 fun StyleTransferScreen(
     viewModel: MainViewModel,
     onGenerate: (Int) -> Unit,
-    onUploadModel: () -> Unit // 新增参数
+    onUploadModel: () -> Unit
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val photoPicker = rememberLauncherForActivityResult(
@@ -256,7 +234,7 @@ fun StyleTransferScreen(
 
         item {
             Text("MNN Style Transfer", fontSize = 22.sp, fontWeight = FontWeight.Bold)
-            Text("Adreno GPU (OpenGL ES 3.0)", fontSize = 12.sp, color = Color.Gray)
+            Text("CPU Optimized (FP16)", fontSize = 12.sp, color = Color.Gray)
             Spacer(modifier = Modifier.height(12.dp))
         }
 
@@ -274,26 +252,17 @@ fun StyleTransferScreen(
         }
 
         item {
-            Text("Input Image", fontWeight = FontWeight.Bold)
-            Spacer(modifier = Modifier.height(8.dp))
             BigImageCard(uiState.originalBitmap) {
                 photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
             }
             Spacer(modifier = Modifier.height(20.dp))
-        }
-
-        item {
-            Text("Result", fontWeight = FontWeight.Bold)
-            Spacer(modifier = Modifier.height(8.dp))
             BigImageCard(uiState.resultBitmap) { }
             Spacer(modifier = Modifier.height(24.dp))
         }
 
+        // 风格选择按钮
         item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly
-            ) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                 Button(
                     onClick = { selectedStyleId = 0 },
                     colors = ButtonDefaults.buttonColors(
@@ -311,19 +280,34 @@ fun StyleTransferScreen(
             Spacer(modifier = Modifier.height(16.dp))
         }
 
-        // === 新增：上传自定义模型按钮 ===
+        // 步数滑块 (Steps Slider)
+        item {
+            Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
+                Text("Inference Steps: ${uiState.steps}", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                Slider(
+                    value = uiState.steps.toFloat(),
+                    onValueChange = { viewModel.setSteps(it.toInt()) },
+                    valueRange = 1f..20f,
+                    steps = 19,
+                    enabled = !uiState.isProcessing
+                )
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+        }
+
+        // 上传模型按钮
         item {
             OutlinedButton(
                 onClick = onUploadModel,
                 enabled = !uiState.isProcessing,
-                modifier = Modifier.fillMaxWidth().height(50.dp)
+                modifier = Modifier.fillMaxWidth().height(48.dp)
             ) {
                 Text("Upload Custom Flow.mnn")
             }
             Spacer(modifier = Modifier.height(16.dp))
         }
-        // ============================
 
+        // 生成按钮
         item {
             Button(
                 onClick = {
@@ -341,7 +325,7 @@ fun StyleTransferScreen(
                     Spacer(modifier = Modifier.width(8.dp))
                     Text("Processing...")
                 } else {
-                    Text(if (uiState.originalBitmap == null) "Select Image" else "Generate Style")
+                    Text(if (uiState.originalBitmap == null) "Select Image" else "Generate")
                 }
             }
             Spacer(modifier = Modifier.height(100.dp))
@@ -353,8 +337,7 @@ fun StyleTransferScreen(
 fun BigImageCard(bitmap: Bitmap?, onClick: () -> Unit) {
     Box(
         modifier = Modifier
-            .fillMaxWidth()
-            .aspectRatio(1f)
+            .size(300.dp) // 固定大小稍微小一点适配屏幕
             .clip(RoundedCornerShape(12.dp))
             .background(Color.LightGray)
             .border(1.dp, Color.Gray, RoundedCornerShape(12.dp))
@@ -370,8 +353,7 @@ fun BigImageCard(bitmap: Bitmap?, onClick: () -> Unit) {
             )
         } else {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("Select Photo", color = Color.White, fontWeight = FontWeight.Bold)
-                Text("Target: 512x512", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
+                Text("Select / Result", color = Color.White, fontWeight = FontWeight.Bold)
             }
         }
     }

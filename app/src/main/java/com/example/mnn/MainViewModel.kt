@@ -22,18 +22,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     var isEngineReady = false
 
+    // 更新状态文本
     fun updateStatus(msg: String) {
         _uiState.value = _uiState.value.copy(statusMessage = msg)
     }
 
+    // 设置处理中状态（锁定 UI）
     fun setProcessing(processing: Boolean) {
         _uiState.value = _uiState.value.copy(isProcessing = processing)
     }
 
+    // 设置生成结果
     fun setResult(bitmap: Bitmap) {
         _uiState.value = _uiState.value.copy(resultBitmap = bitmap)
     }
 
+    // 新增：设置 Flow 步数
+    fun setSteps(steps: Int) {
+        _uiState.value = _uiState.value.copy(steps = steps)
+    }
+
+    // 处理图片选择
     fun onImageSelected(uri: Uri) {
         viewModelScope.launch(Dispatchers.IO) {
             val bitmap = loadAndScaleBitmap(uri)
@@ -49,18 +58,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * 新增功能：替换模型文件
-     * 将用户选中的 Uri 内容复制到 cacheDir/Flow.mnn
-     */
+    // 新增：替换模型文件功能
     fun replaceModelFile(uri: Uri, cacheDir: File, onComplete: (Boolean) -> Unit) {
         if (_uiState.value.isProcessing) {
-            updateStatus("系统正忙，请稍后...")
+            updateStatus("系统忙，请稍后...")
             return
         }
 
-        updateStatus("正在读取新模型文件...")
-        setProcessing(true) // 锁定 UI
+        updateStatus("正在上传新模型...")
+        setProcessing(true)
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -69,14 +75,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
                 if (inputStream == null) {
                     withContext(Dispatchers.Main) {
-                        updateStatus("无法打开文件")
+                        updateStatus("无法读取文件")
                         setProcessing(false)
                         onComplete(false)
                     }
                     return@launch
                 }
 
-                // 目标文件固定为 Flow.mnn，以便 C++ 引擎加载
+                // 强制覆盖名为 Flow.mnn 的文件
                 val targetFile = File(cacheDir, "Flow.mnn")
                 if (targetFile.exists()) {
                     targetFile.delete()
@@ -88,14 +94,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 inputStream.close()
 
                 withContext(Dispatchers.Main) {
-                    updateStatus("模型写入成功，准备重启引擎...")
-                    // 注意：这里不立即 setProcessing(false)，等待引擎重启完成
+                    updateStatus("模型写入完成，准备重载引擎...")
+                    // 注意：这里不设为 false，等待 Engine 重启完成
                     onComplete(true)
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
                 withContext(Dispatchers.Main) {
-                    updateStatus("模型更新失败: ${e.message}")
+                    updateStatus("上传失败: ${e.message}")
                     setProcessing(false)
                     onComplete(false)
                 }
@@ -113,7 +119,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (original != null) {
                 // 1. 缩放
                 val scaled = Bitmap.createScaledBitmap(original, 512, 512, true)
-                // 2. 【关键】强制转换为 ARGB_8888 格式 (软件位图)，防止 HARDWARE Bitmap 导致 Native Crash
+                // 2. 转换为 ARGB_8888 (软件位图) 以兼容 JNI
                 if (scaled.config != Bitmap.Config.ARGB_8888) {
                     scaled.copy(Bitmap.Config.ARGB_8888, true)
                 } else {
@@ -127,9 +133,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 }
 
+// UI 状态类，新增 steps 字段
 data class UiState(
     val statusMessage: String = "正在初始化模型...",
     val isProcessing: Boolean = false,
     val originalBitmap: Bitmap? = null,
-    val resultBitmap: Bitmap? = null
+    val resultBitmap: Bitmap? = null,
+    val steps: Int = 4 // 默认步数
 )

@@ -13,23 +13,21 @@
 #include <MNN/MNNDefine.h>
 #include <MNN/ImageProcess.hpp>
 
-#define LOG_TAG "SAFlow_Debug"
+#define LOG_TAG "SAFlow_JNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 using namespace MNN;
 
 static std::string g_log_path = "";
 
-// 增强型日志：带时间戳，确保写入文件
+// 日志工具：同时输出到 Logcat 和文件
 void WriteLog(const char* fmt, ...) {
     char buf[1024];
     va_list args; va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args); va_end(args);
 
-    // 打印到 Logcat
     LOGI("%s", buf);
 
-    // 写入文件
     if (!g_log_path.empty()) {
         std::ofstream os(g_log_path, std::ios::app);
         if (os.is_open()) {
@@ -48,86 +46,75 @@ public:
 
     SAFlowEngine(const std::string& path) {
         g_log_path = path + "/sa_debug.txt";
-        // 清空旧日志
+        // 每次初始化清空旧日志
         std::ofstream(g_log_path, std::ios::trunc).close();
 
-        WriteLog("==============================================");
-        WriteLog(">>> ENGINE INIT: MNN 3.3 | Snapdragon 8 Elite <<<");
+        WriteLog("=== ENGINE INIT: CPU SAFE MODE ===");
         WriteLog("Model Path: %s", path.c_str());
 
+        // --- CPU 优化配置 ---
         ScheduleConfig config;
-        config.type = MNN_FORWARD_OPENGL; // 尝试强制 OpenGL
-        config.numThread = 1;
+        config.type = MNN_FORWARD_CPU; // 强制 CPU
+        config.numThread = 4;          // 4线程平衡性能与发热
 
         BackendConfig bConfig;
-        bConfig.precision = BackendConfig::Precision_Low;
-        bConfig.power = BackendConfig::Power_High;
+        bConfig.precision = BackendConfig::Precision_Low; // 开启 FP16 (ARMv8.2+)
+        bConfig.power = BackendConfig::Power_High;        // 倾向使用大核
+        bConfig.memory = BackendConfig::Memory_High;      // 空间换时间
         config.backendConfig = &bConfig;
-        config.mode = MNN_GPU_TUNING_WIDE;
 
         // 加载 Encoder
         netEnc.reset(Interpreter::createFromFile((path + "/Encoder.mnn").c_str()));
-        if (!netEnc) WriteLog("❌ Failed to load Encoder.mnn");
-        sessEnc = netEnc->createSession(config);
-        checkBackend(netEnc, sessEnc, "Encoder");
+        if (netEnc) {
+            sessEnc = netEnc->createSession(config);
+            netEnc->releaseModel(); // 释放模型Buffer以节省内存
+        } else {
+            WriteLog("❌ Failed to load Encoder.mnn");
+        }
 
-        // 加载 Flow
+        // 加载 Flow (注意：这里会读取最新的 Flow.mnn)
         netFlow.reset(Interpreter::createFromFile((path + "/Flow.mnn").c_str()));
-        if (!netFlow) WriteLog("❌ Failed to load Flow.mnn");
-        sessFlow = netFlow->createSession(config);
-        checkBackend(netFlow, sessFlow, "Flow_Iter");
+        if (netFlow) {
+            sessFlow = netFlow->createSession(config);
+            netFlow->releaseModel();
+        } else {
+            WriteLog("❌ Failed to load Flow.mnn");
+        }
 
         // 加载 Decoder
         netDec.reset(Interpreter::createFromFile((path + "/Decoder.mnn").c_str()));
-        if (!netDec) WriteLog("❌ Failed to load Decoder.mnn");
-        sessDec = netDec->createSession(config);
-        checkBackend(netDec, sessDec, "Decoder");
-
-        // 释放权重内存
-        netEnc->releaseModel();
-        netFlow->releaseModel();
-        netDec->releaseModel();
-        WriteLog(">>> Engine Ready <<<");
-    }
-
-    // 详尽监控后端：确定是否 Fallback
-    void checkBackend(std::unique_ptr<Interpreter>& net, Session* sess, const char* name) {
-        if (!sess) {
-            WriteLog("[%s] ❌ Session Creation FAILED!", name);
-            return;
+        if (netDec) {
+            sessDec = netDec->createSession(config);
+            netDec->releaseModel();
+        } else {
+            WriteLog("❌ Failed to load Decoder.mnn");
         }
-        float bType = -1.0f;
-        net->getSessionInfo(sess, MNN::Interpreter::BACKEND_INFO, &bType);
 
-        int type = (int)bType;
-        const char* typeStr = "UNKNOWN";
-        if (type == MNN_FORWARD_CPU) typeStr = "CPU (Fallback! ❌)";
-        else if (type == MNN_FORWARD_OPENCL) typeStr = "OPENCL (GPU ✅)";
-        else if (type == MNN_FORWARD_OPENGL) typeStr = "OPENGL (GPU ✅)";
-        else if (type == MNN_FORWARD_VULKAN) typeStr = "VULKAN (GPU ✅)";
-
-        WriteLog("[%s] Backend Reported Code: %d", name, type);
-        WriteLog("[%s] Backend Actual Identification: %s", name, typeStr);
+        WriteLog(">>> CPU Engine Ready (FP16, 4 Threads) <<<");
     }
 
-    bool run(JNIEnv* env, jobject inBmp, jobject outBmp, int style) {
+    bool run(JNIEnv* env, jobject inBmp, jobject outBmp, int style, int steps) {
         if (!sessEnc || !sessFlow || !sessDec) {
-            WriteLog("❌ Cannot run: Sessions not ready");
+            WriteLog("❌ Sessions not ready");
             return false;
         }
 
         auto t_all_start = std::chrono::high_resolution_clock::now();
 
         // --- STEP 1: ENCODER ---
-        auto t_step_start = std::chrono::high_resolution_clock::now();
         auto tEncIn = netEnc->getSessionInput(sessEnc, "input");
+
+        // 锁定位图处理
         void* pixels;
         AndroidBitmap_lockPixels(env, inBmp, &pixels);
         if (!imgProc) {
             CV::ImageProcess::Config c;
             c.sourceFormat = CV::RGBA; c.destFormat = CV::RGB;
-            float m[3]={127.5f, 127.5f, 127.5f}, n[3]={0.007843f, 0.007843f, 0.007843f};
-            memcpy(c.mean, m, sizeof(m)); memcpy(c.normal, n, sizeof(n));
+            // mean=[127.5, ...], normal=[1/127.5, ...]
+            float m[3]={127.5f, 127.5f, 127.5f};
+            float n[3]={0.007843f, 0.007843f, 0.007843f};
+            memcpy(c.mean, m, sizeof(m));
+            memcpy(c.normal, n, sizeof(n));
             imgProc.reset(CV::ImageProcess::create(c));
         }
         imgProc->convert((const uint8_t*)pixels, 512, 512, 0, tEncIn);
@@ -136,21 +123,14 @@ public:
         netEnc->runSession(sessEnc);
         auto tEncOut = netEnc->getSessionOutput(sessEnc, "output");
 
-        auto t_step_end = std::chrono::high_resolution_clock::now();
-        WriteLog("[Step 1] Encoder Run Time: %.2f ms", std::chrono::duration<float, std::milli>(t_step_end - t_step_start).count());
-
-        // --- STEP 2: FLOW (Loop) ---
-        t_step_start = std::chrono::high_resolution_clock::now();
-        int size = 1 * 4 * 64 * 64;
+        // --- STEP 2: FLOW LOOP ---
+        // 准备 Latent
+        int size = 1 * 4 * 64 * 64; // shape: [1, 4, 64, 64]
         std::vector<float> latents(size);
 
-        // 监控第一次同步开销
-        auto t_sync_start = std::chrono::high_resolution_clock::now();
+        // Copy Encoder Output -> CPU -> Latents
         std::unique_ptr<Tensor> hostL(new Tensor(tEncOut, Tensor::CAFFE));
         tEncOut->copyToHostTensor(hostL.get());
-        auto t_sync_end = std::chrono::high_resolution_clock::now();
-        WriteLog("[Step 2] Initial Sync (GPU->CPU) Time: %.2f ms", std::chrono::duration<float, std::milli>(t_sync_end - t_sync_start).count());
-
         memcpy(latents.data(), hostL->host<float>(), size * sizeof(float));
 
         auto fXt = netFlow->getSessionInput(sessFlow, "x_t");
@@ -159,40 +139,49 @@ public:
         auto fS = netFlow->getSessionInput(sessFlow, "s");
         auto fOut = netFlow->getSessionOutput(sessFlow, "output");
 
+        // 设置 Condition (Encoder output)
         fXc->copyFromHostTensor(hostL.get());
+
+        // 设置 Style ID
         std::unique_ptr<Tensor> hS(new Tensor(fS, Tensor::CAFFE));
         hS->host<int>()[0] = style;
         fS->copyFromHostTensor(hS.get());
 
+        // 预分配 Buffer
         std::unique_ptr<Tensor> hXt(new Tensor(fXt, Tensor::CAFFE));
         std::unique_ptr<Tensor> hT(new Tensor(fT, Tensor::CAFFE));
         std::unique_ptr<Tensor> hV(new Tensor(fOut, Tensor::CAFFE));
 
-        float loop_sync_total = 0;
-        for (int i = 0; i < 4; i++) {
+        // 动态步数控制 (限制在 1~50 之间防止死机)
+        int safe_steps = std::max(1, std::min(steps, 50));
+        float dt = 1.0f / (float)safe_steps * 0.2f; // 简单缩放时间步长，保持总流形长度大致一致（可选逻辑）
+        // 或者保持固定步长 dt=0.05，此时 steps 越多效果越强/变化越大
+        // 这里采用原逻辑：步长固定 0.05
+        float fixed_dt = 0.05f;
+
+        for (int i = 0; i < safe_steps; i++) {
+            // 输入当前的 latents
             memcpy(hXt->host<float>(), latents.data(), size * sizeof(float));
             fXt->copyFromHostTensor(hXt.get());
-            hT->host<float>()[0] = (float)i * 0.05f;
+
+            // 输入时间 t
+            hT->host<float>()[0] = (float)i * fixed_dt;
             fT->copyFromHostTensor(hT.get());
 
+            // 推理
             netFlow->runSession(sessFlow);
 
-            auto t_lsync_start = std::chrono::high_resolution_clock::now();
+            // 获取速度场 v
             fOut->copyToHostTensor(hV.get());
-            auto t_lsync_end = std::chrono::high_resolution_clock::now();
-            loop_sync_total += std::chrono::duration<float, std::milli>(t_lsync_end - t_lsync_start).count();
-
             float* v = hV->host<float>();
-            for (int j = 0; j < size; j++) latents[j] += v[j] * 0.05f;
 
-            if(i % 5 == 0) WriteLog("... Flow Iteration %d/20 done", i);
+            // Euler 积分更新: x = x + v * dt
+            for (int j = 0; j < size; j++) {
+                latents[j] += v[j] * fixed_dt;
+            }
         }
-        t_step_end = std::chrono::high_resolution_clock::now();
-        WriteLog("[Step 2] Total Flow Loop Time: %.2f ms (Sync Overhead: %.2f ms)",
-                 std::chrono::duration<float, std::milli>(t_step_end - t_step_start).count(), loop_sync_total);
 
         // --- STEP 3: DECODER ---
-        t_step_start = std::chrono::high_resolution_clock::now();
         auto dIn = netDec->getSessionInput(sessDec, "input");
         std::unique_ptr<Tensor> hDecIn(new Tensor(dIn, Tensor::CAFFE));
         memcpy(hDecIn->host<float>(), latents.data(), size * sizeof(float));
@@ -200,47 +189,56 @@ public:
 
         netDec->runSession(sessDec);
         auto dOut = netDec->getSessionOutput(sessDec, "output");
-        t_step_end = std::chrono::high_resolution_clock::now();
-        WriteLog("[Step 3] Decoder Run Time: %.2f ms", std::chrono::duration<float, std::milli>(t_step_end - t_step_start).count());
 
-        // --- STEP 4: OUTPUT ---
-        t_step_start = std::chrono::high_resolution_clock::now();
+        // --- STEP 4: OUTPUT RENDER ---
         AndroidBitmap_lockPixels(env, outBmp, &pixels);
         std::unique_ptr<Tensor> hFinal(new Tensor(dOut, Tensor::CAFFE));
         dOut->copyToHostTensor(hFinal.get());
 
         float* data = hFinal->host<float>();
         uint8_t* rgba = (uint8_t*)pixels;
-        for (int i = 0; i < 512*512; i++) {
-            rgba[i*4+0] = (uint8_t)std::clamp(data[i]*255.0f, 0.0f, 255.0f);
-            rgba[i*4+1] = (uint8_t)std::clamp(data[i+262144]*255.0f, 0.0f, 255.0f);
-            rgba[i*4+2] = (uint8_t)std::clamp(data[i+524288]*255.0f, 0.0f, 255.0f);
-            rgba[i*4+3] = 255;
+        int total_pixels = 512 * 512;
+
+        // 简单的反归一化与排布
+        for (int i = 0; i < total_pixels; i++) {
+            // Channel 0, 1, 2 分别偏移 0, 262144, 524288
+            float r = data[i];
+            float g = data[i + total_pixels];
+            float b = data[i + total_pixels * 2];
+
+            rgba[i*4+0] = (uint8_t)std::clamp(r * 255.0f, 0.0f, 255.0f);
+            rgba[i*4+1] = (uint8_t)std::clamp(g * 255.0f, 0.0f, 255.0f);
+            rgba[i*4+2] = (uint8_t)std::clamp(b * 255.0f, 0.0f, 255.0f);
+            rgba[i*4+3] = 255; // Alpha
         }
         AndroidBitmap_unlockPixels(env, outBmp);
-        t_step_end = std::chrono::high_resolution_clock::now();
-        WriteLog("[Step 4] Bitmap Render Time: %.2f ms", std::chrono::duration<float, std::milli>(t_step_end - t_step_start).count());
 
         auto t_all_end = std::chrono::high_resolution_clock::now();
-        WriteLog(">>> TOTAL INFERENCE TIME: %.2f ms", std::chrono::duration<float, std::milli>(t_all_end - t_all_start).count());
-        WriteLog("==============================================");
+        float cost = std::chrono::duration<float, std::milli>(t_all_end - t_all_start).count();
+        WriteLog("Success: steps=%d, cost=%.2f ms", safe_steps, cost);
+
         return true;
     }
 };
 
+// 全局引擎指针
 static SAFlowEngine* g_engine = nullptr;
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_example_mnn_MainActivity_initEngine(JNIEnv* env, jobject thiz, jstring jCacheDir) {
     const char* path = env->GetStringUTFChars(jCacheDir, nullptr);
-    if (g_engine) { delete g_engine; g_engine = nullptr; }
+    if (g_engine) {
+        delete g_engine;
+        g_engine = nullptr;
+    }
     g_engine = new SAFlowEngine(path);
     env->ReleaseStringUTFChars(jCacheDir, path);
     return JNI_TRUE;
 }
 
+// 注意：增加了 steps 参数
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_example_mnn_MainActivity_runStyleTransfer(JNIEnv* env, jobject thiz, jobject src, jobject dst, jint styleId) {
+Java_com_example_mnn_MainActivity_runStyleTransfer(JNIEnv* env, jobject thiz, jobject src, jobject dst, jint styleId, jint steps) {
     if (!g_engine) return JNI_FALSE;
-    return g_engine->run(env, src, dst, (int)styleId);
+    return g_engine->run(env, src, dst, (int)styleId, (int)steps);
 }
