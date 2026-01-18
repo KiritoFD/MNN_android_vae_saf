@@ -463,7 +463,7 @@ public:
         /** Mode / NumberThread, int* */
         THREAD_NUMBER = 4,
 
-        ALL
+        ALL, BACKEND_INFO
     };
 
     /**

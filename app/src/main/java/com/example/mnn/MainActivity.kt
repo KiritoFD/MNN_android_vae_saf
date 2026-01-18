@@ -41,24 +41,40 @@ import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
+    // Native 方法声明
     external fun initEngine(cacheDir: String): Boolean
     external fun runStyleTransfer(src: Bitmap, dst: Bitmap, styleId: Int): Boolean
 
+    companion object {
+        init {
+            try {
+                // 按照官方库链接逻辑加载
+                System.loadLibrary("MNN")
+                System.loadLibrary("MNN_Express")
+                // 既然只用 OpenGL，我们不再显式加载 Vulkan 库，减少驱动冲突
+                System.loadLibrary("sd_engine")
+                Log.i("SAFlow_JNI", "Native Libraries Loaded Successfully")
+            } catch (e: Exception) {
+                Log.e("SAFlow_JNI", "Native Lib Load Failed: ${e.message}")
+            }
+        }
+    }
+
     private val logFile by lazy { File(cacheDir, "java_debug.txt") }
-    private val crashFile by lazy { File(cacheDir, "crash_log.txt") } // 专门记录闪退
+    private val crashFile by lazy { File(cacheDir, "crash_log.txt") }
     private val viewModel: MainViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 【核武器】全局崩溃捕获器
-        // 只要 App 闪退，就会把错误堆栈写进 crash_log.txt
+        // 全局崩溃捕获（参考官方 CrashUtil 思路）
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             handleCrash(throwable)
         }
 
+        // 异步初始化资源
         lifecycleScope.launch(Dispatchers.IO) {
-            safeLoadLibrariesAndModels()
+            prepareModelsAndEngine()
         }
 
         setContent {
@@ -76,28 +92,19 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // 处理崩溃：写入文件
     private fun handleCrash(e: Throwable) {
         try {
             val sw = StringWriter()
-            val pw = PrintWriter(sw)
-            e.printStackTrace(pw)
+            e.printStackTrace(PrintWriter(sw))
             val stackTrace = sw.toString()
-
             val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
             val report = "\n[$time] CRASH REPORT:\n$stackTrace\n"
 
-            // 写入 crash_log.txt
-            FileOutputStream(crashFile, true).use {
-                it.write(report.toByteArray())
-            }
-
-            // 同时写入 debug log
+            FileOutputStream(crashFile, true).use { it.write(report.toByteArray()) }
             writeLog("APP CRASHED! See crash_log.txt")
         } catch (ex: Exception) {
-            // 既然都崩了，这里也没办法了
+            Log.e("SAFlow_Crash", "Failed to write crash log")
         } finally {
-            // 必须杀掉进程，否则会黑屏卡死
             android.os.Process.killProcess(android.os.Process.myPid())
             System.exit(1)
         }
@@ -111,18 +118,16 @@ class MainActivity : ComponentActivity() {
         }
 
         viewModel.setProcessing(true)
-        viewModel.updateStatus("生成中 (OpenCL)...")
+        viewModel.updateStatus("生成中 (OpenGL)...") // 已修改为 OpenGL
 
         lifecycleScope.launch(Dispatchers.Default) {
             try {
-                // 确保宽高一致，防止底层越界
                 val w = 512
                 val h = 512
+                // 确保使用 ARGB_8888 适配 MNN ImageProcess [cite: 6]
                 val output = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
 
-                // 双重检查 Bitmap 状态
                 if (input.isRecycled) throw RuntimeException("Input Bitmap is recycled!")
-                if (input.width != w || input.height != h) throw RuntimeException("Input size mismatch: ${input.width}x${input.height}")
 
                 val start = System.currentTimeMillis()
                 val success = runStyleTransfer(input, output, styleId)
@@ -134,48 +139,41 @@ class MainActivity : ComponentActivity() {
                         viewModel.setResult(output)
                         viewModel.updateStatus("完成! 耗时: ${cost}ms")
                     } else {
-                        viewModel.updateStatus("生成失败 (看日志)")
+                        viewModel.updateStatus("生成失败 (后端回退)")
                     }
                 }
             } catch (e: Exception) {
-                // 这里捕获的是逻辑错误，Thread.setDefaultUncaughtExceptionHandler 捕获的是闪退
                 withContext(Dispatchers.Main) {
                     viewModel.setProcessing(false)
                     viewModel.updateStatus("Err: ${e.message}")
                     writeLog("Logic Error: ${e.message}")
-                    // 如果是严重错误，手动触发记录
-                    handleCrash(e)
                 }
             }
         }
     }
 
-    private suspend fun safeLoadLibrariesAndModels() {
-        writeLog("App Start")
+    private suspend fun prepareModelsAndEngine() {
+        writeLog("Preparing Engine...")
         try {
-            System.loadLibrary("c++_shared")
-            System.loadLibrary("MNN")
-            System.loadLibrary("sd_engine")
-
+            // 拷贝 Asset 模型文件
             val modelFiles = listOf("Encoder.mnn", "Flow.mnn", "Decoder.mnn")
             for (fileName in modelFiles) {
                 val outFile = File(cacheDir, fileName)
-                // 每次都覆盖拷贝，防止文件损坏
                 copyAssetResource(fileName, outFile)
             }
 
+            // 初始化 Native 引擎
             val success = initEngine(cacheDir.absolutePath)
             withContext(Dispatchers.Main) {
                 if (success) {
                     viewModel.isEngineReady = true
-                    viewModel.updateStatus("引擎就绪 (Snapdragon 8 Elite)")
+                    viewModel.updateStatus("引擎就绪 (Honor 8 Elite OpenGL)")
                 } else {
-                    viewModel.updateStatus("初始化失败")
+                    viewModel.updateStatus("OpenGL 初始化失败")
                 }
             }
         } catch (e: Throwable) {
-            writeLog("Load Error: ${e.message}")
-            e.printStackTrace()
+            writeLog("Initialization Error: ${e.message}")
         }
     }
 
@@ -185,14 +183,16 @@ class MainActivity : ComponentActivity() {
 
     private fun copyAssetResource(assetName: String, outFile: File): Boolean {
         return try {
-            assets.open(assetName).use { input -> FileOutputStream(outFile).use { output -> input.copyTo(output) } }
+            assets.open(assetName).use { input ->
+                FileOutputStream(outFile).use { output -> input.copyTo(output) }
+            }
             true
         } catch (e: Exception) { false }
     }
 }
 
 // ==========================================
-// UI 部分 (超级安全版)
+// UI 部分
 // ==========================================
 
 @Composable
@@ -201,27 +201,22 @@ fun StyleTransferScreen(
     onGenerate: (Int) -> Unit
 ) {
     val uiState by viewModel.uiState.collectAsState()
-
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia(),
         onResult = { uri -> if (uri != null) viewModel.onImageSelected(uri) }
     )
-
     var selectedStyleId by remember { mutableIntStateOf(0) }
 
-    // 使用 LazyColumn 是解决滚动冲突的最佳方案
-    // 如果这里还崩，说明是 Compose 版本或系统兼容性的大问题
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(16.dp), // 简单的 Padding，不依赖 systemBars
+        contentPadding = PaddingValues(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // 顶部留白适配状态栏 (粗暴但有效)
         item { Spacer(modifier = Modifier.height(40.dp)) }
 
         item {
             Text("MNN Style Transfer", fontSize = 22.sp, fontWeight = FontWeight.Bold)
-            Text("Adreno GPU (OpenCL)", fontSize = 12.sp, color = Color.Gray)
+            Text("Adreno GPU (OpenGL ES 3.0)", fontSize = 12.sp, color = Color.Gray) // 修改 UI 描述
             Spacer(modifier = Modifier.height(12.dp))
         }
 
@@ -239,7 +234,7 @@ fun StyleTransferScreen(
         }
 
         item {
-            Text("Input (Original)", fontWeight = FontWeight.Bold)
+            Text("Input Image", fontWeight = FontWeight.Bold)
             Spacer(modifier = Modifier.height(8.dp))
             BigImageCard(uiState.originalBitmap) {
                 photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
@@ -248,7 +243,7 @@ fun StyleTransferScreen(
         }
 
         item {
-            Text("Output (Result)", fontWeight = FontWeight.Bold)
+            Text("Result", fontWeight = FontWeight.Bold)
             Spacer(modifier = Modifier.height(8.dp))
             BigImageCard(uiState.resultBitmap) { }
             Spacer(modifier = Modifier.height(24.dp))
@@ -264,14 +259,14 @@ fun StyleTransferScreen(
                     colors = ButtonDefaults.buttonColors(
                         containerColor = if (selectedStyleId == 0) MaterialTheme.colorScheme.primary else Color.LightGray
                     )
-                ) { Text("Style A") }
+                ) { Text("Artistic") }
 
                 Button(
                     onClick = { selectedStyleId = 1 },
                     colors = ButtonDefaults.buttonColors(
                         containerColor = if (selectedStyleId == 1) MaterialTheme.colorScheme.primary else Color.LightGray
                     )
-                ) { Text("Style B") }
+                ) { Text("Photo") }
             }
             Spacer(modifier = Modifier.height(24.dp))
         }
@@ -291,12 +286,12 @@ fun StyleTransferScreen(
                 if (uiState.isProcessing) {
                     CircularProgressIndicator(color = Color.White, modifier = Modifier.size(24.dp))
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("Generating...")
+                    Text("Processing...")
                 } else {
-                    Text(if (uiState.originalBitmap == null) "Select Image" else "Start Generate")
+                    Text(if (uiState.originalBitmap == null) "Select Image" else "Generate Style")
                 }
             }
-            Spacer(modifier = Modifier.height(100.dp)) // 底部超大留白，防止到底部闪退
+            Spacer(modifier = Modifier.height(100.dp))
         }
     }
 }
@@ -322,8 +317,8 @@ fun BigImageCard(bitmap: Bitmap?, onClick: () -> Unit) {
             )
         } else {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("Tap to Select", color = Color.White, fontWeight = FontWeight.Bold)
-                Text("512 x 512", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
+                Text("Select Photo", color = Color.White, fontWeight = FontWeight.Bold)
+                Text("Target: 512x512", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
             }
         }
     }

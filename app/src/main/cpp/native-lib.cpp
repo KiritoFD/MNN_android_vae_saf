@@ -2,289 +2,167 @@
 #include <string>
 #include <vector>
 #include <fstream>
-#include <cstdarg>
-#include <random>
-#include <chrono> // 新增：用于精确计时
 #include <android/log.h>
 #include <android/bitmap.h>
+#include <chrono>
+#include <algorithm>
+#include <memory>
 
+// MNN 核心头文件
 #include <MNN/Interpreter.hpp>
 #include <MNN/MNNDefine.h>
 #include <MNN/ImageProcess.hpp>
 
-#define LOG_TAG "MNN_NATIVE"
-
-static std::string g_LogFilePath = "";
-
-std::string GetTimeStr() {
-    time_t now = time(0);
-    struct tm tstruct;
-    char buf[80];
-    tstruct = *localtime(&now);
-    strftime(buf, sizeof(buf), "%Y-%m-%d %X", &tstruct);
-    return std::string(buf);
-}
-
-void WriteLog(const char* level, const char* format, ...) {
-    char buffer[1024];
-    va_list args;
-    va_start(args, format);
-    vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
-    std::string msg = buffer;
-
-    __android_log_print(strcmp(level, "INFO") == 0 ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, LOG_TAG, "%s", buffer);
-
-    if (!g_LogFilePath.empty()) {
-        std::ofstream outfile;
-        outfile.open(g_LogFilePath, std::ios_base::app);
-        if (outfile.is_open()) {
-            outfile << "[" << GetTimeStr() << "] [" << level << "] " << msg << std::endl;
-            outfile.close();
-        }
-    }
-}
-
-#define LOGI(...) WriteLog("INFO", __VA_ARGS__)
-#define LOGE(...) WriteLog("ERROR", __VA_ARGS__)
+#define LOG_TAG "SAFlow_CPU_Final"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 using namespace MNN;
-using namespace MNN::CV;
 
-void generateNoise(float* buffer, int size) {
-    std::mt19937 gen(42);
-    std::normal_distribution<float> d(0.0f, 1.0f);
-    for (int i = 0; i < size; i++) {
-        buffer[i] = d(gen);
-    }
-}
-
-// 简单的计时器类
-class Timer {
-    std::chrono::high_resolution_clock::time_point start;
+/**
+ * SAFlow 引擎类：深度适配骁龙 8 Elite CPU
+ */
+class SAFlowEngine {
 public:
-    Timer() { reset(); }
-    void reset() { start = std::chrono::high_resolution_clock::now(); }
-    // 返回毫秒
-    float elapsed() {
-        auto end = std::chrono::high_resolution_clock::now();
-        return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0f;
-    }
-};
+    std::unique_ptr<Interpreter> netEnc, netFlow, netDec;
+    Session *sessEnc = nullptr, *sessFlow = nullptr, *sessDec = nullptr;
+    // RuntimeInfo 包含 Runtime 句柄和相关的配置是否生效的信息
+    RuntimeInfo mRuntimeInfo;
 
-class SAFlowPipeline {
-public:
-    std::shared_ptr<Interpreter> encNet, flowNet, decNet;
-    Session *encSess = nullptr, *flowSess = nullptr, *decSess = nullptr;
+    // 静态缓存：5步 Reflow 的时间步 t
+    const std::vector<float> mStepsT = {0.0f, 0.25f, 0.5f, 0.75f, 1.0f};
 
-    Tensor *encInput = nullptr, *encOutput = nullptr;
-    Tensor *flowXt = nullptr, *flowXCond = nullptr, *flowT = nullptr, *flowS = nullptr, *flowOutput = nullptr;
-    Tensor *decInput = nullptr, *decOutput = nullptr;
+    SAFlowEngine(const std::string& path) {
+        LOGI(">>> Initializing SAFlow CPU Engine for Snapdragon 8 Elite <<<");
 
-    std::shared_ptr<ImageProcess> imgProcessor;
+        // 1. 设置 CPU 推理配置
+        ScheduleConfig config;
+        config.type = MNN_FORWARD_CPU;
 
-    SAFlowPipeline(const std::string& cacheDir) {
-        LOGI("========== 引擎初始化 ==========");
-        LOGI("目标设备: OpenCL (GPU)");
-        LOGI("精度配置: FP16 (Precision_Low)");
-        LOGI("线程数: 4");
+        // 🚀 核心优化：骁龙 8 Elite 建议使用 2 线程
+        config.numThread = 2;
 
-        // 加载模型...
-        if (!loadModel(cacheDir + "/Encoder.mnn", encNet, encSess, "Encoder")) return;
-        encInput = encNet->getSessionInput(encSess, "input");
-        encOutput = encNet->getSessionOutput(encSess, "output");
+        BackendConfig bConfig;
+        // 🚀 核心优化：强制开启 FP16 以适配 Oryon 架构
+        bConfig.precision = BackendConfig::Precision_Low;
+        bConfig.power = BackendConfig::Power_High;
+        config.backendConfig = &bConfig;
 
-        if (!loadModel(cacheDir + "/Flow.mnn", flowNet, flowSess, "Flow")) return;
-        flowXt = flowNet->getSessionInput(flowSess, "x_t");
-        flowXCond = flowNet->getSessionInput(flowSess, "x_cond");
-        flowT = flowNet->getSessionInput(flowSess, "t");
-        flowS = flowNet->getSessionInput(flowSess, "s");
-        flowOutput = flowNet->getSessionOutput(flowSess, "output");
+        // 2. 加载模型
+        netEnc.reset(Interpreter::createFromFile((path + "/Encoder.mnn").c_str()));
+        netFlow.reset(Interpreter::createFromFile((path + "/Flow.mnn").c_str()));
+        netDec.reset(Interpreter::createFromFile((path + "/Decoder.mnn").c_str()));
 
-        if (!loadModel(cacheDir + "/Decoder.mnn", decNet, decSess, "Decoder")) return;
-        decInput = decNet->getSessionInput(decSess, "input");
-        decOutput = decNet->getSessionOutput(decSess, "output");
+        // 3. 内存池优化：修正此处参数类型错误
+        // createRuntime 需要 std::vector<ScheduleConfig>，此处使用 {} 进行隐式转换
+        mRuntimeInfo = MNN::Interpreter::createRuntime({config});
 
-        ImageProcess::Config imgConfig;
-        imgConfig.sourceFormat = RGBA;
-        imgConfig.destFormat   = RGB;
-        float mean[3]   = {127.5f, 127.5f, 127.5f};
-        float normal[3] = {1.0f / 127.5f, 1.0f / 127.5f, 1.0f / 127.5f};
-        ::memcpy(imgConfig.mean, mean, sizeof(mean));
-        ::memcpy(imgConfig.normal, normal, sizeof(normal));
-        imgProcessor = std::shared_ptr<ImageProcess>(ImageProcess::create(imgConfig));
+        // 使用共享的 RuntimeInfo 创建各模型的 Session，实现内存池和线程池共享
+        sessEnc = netEnc->createSession(config, mRuntimeInfo);
+        sessFlow = netFlow->createSession(config, mRuntimeInfo);
+        sessDec = netDec->createSession(config, mRuntimeInfo);
 
-        LOGI("初始化完成。");
+        // 释放原始权重内存，仅保留运行 Session 所需内存
+        netEnc->releaseModel();
+        netFlow->releaseModel();
+        netDec->releaseModel();
+        LOGI(">>> CPU Engine Ready (FP16 + 2-Threads) <<<");
     }
 
-    ~SAFlowPipeline() {
-        if(encNet) encNet->releaseSession(encSess);
-        if(flowNet) flowNet->releaseSession(flowSess);
-        if(decNet) decNet->releaseSession(decSess);
-    }
+    bool run(JNIEnv* env, jobject inBmp, jobject outBmp, int styleId) {
+        if (!sessEnc || !sessFlow || !sessDec) return false;
 
-    bool isValid() { return encSess && flowSess && decSess; }
+        auto t_start = std::chrono::high_resolution_clock::now();
 
-    bool run(JNIEnv* env, jobject inputBitmap, jobject outputBitmap, int styleIndex, int steps) {
-        if (!isValid()) return false;
-
-        Timer totalTimer;
-        Timer stepTimer;
-
-        // --- 1. Encoder ---
+        // --- STEP 1: ENCODER ---
+        auto tEncIn = netEnc->getSessionInput(sessEnc, "input");
         AndroidBitmapInfo info;
         void* pixels;
-        AndroidBitmap_getInfo(env, inputBitmap, &info);
-        AndroidBitmap_lockPixels(env, inputBitmap, &pixels);
+        AndroidBitmap_getInfo(env, inBmp, &info);
+        AndroidBitmap_lockPixels(env, inBmp, &pixels);
 
-        imgProcessor->convert((const uint8_t*)pixels, 512, 512, 0, encInput);
-        AndroidBitmap_unlockPixels(env, inputBitmap);
+        CV::ImageProcess::Config imgConfig;
+        imgConfig.sourceFormat = CV::RGBA;
+        imgConfig.destFormat = CV::RGB;
+        float mean[3] = {127.5f, 127.5f, 127.5f};
+        float normal[3] = {0.007843f, 0.007843f, 0.007843f};
+        memcpy(imgConfig.mean, mean, sizeof(mean));
+        memcpy(imgConfig.normal, normal, sizeof(normal));
 
-        encNet->runSession(encSess);
-        float t_enc = stepTimer.elapsed();
-        stepTimer.reset();
+        std::unique_ptr<CV::ImageProcess> processer(CV::ImageProcess::create(imgConfig));
+        processer->convert((const uint8_t*)pixels, info.width, info.height, 0, tEncIn);
+        AndroidBitmap_unlockPixels(env, inBmp);
 
-        // --- 2. Flow Loop ---
-        int latentSize = 1 * 4 * 64 * 64;
-        std::vector<float> latents(latentSize);
-        generateNoise(latents.data(), latentSize);
+        netEnc->runSession(sessEnc);
+        auto tEncOut = netEnc->getSessionOutput(sessEnc, "output");
 
-        std::shared_ptr<Tensor> hostCond(new Tensor(flowXCond, Tensor::CAFFE));
-        encOutput->copyToHostTensor(hostCond.get());
-        flowXCond->copyFromHostTensor(hostCond.get());
+        // --- STEP 2: FLOW (5-STEP REFLOW LOOP) ---
+        auto fXt = netFlow->getSessionInput(sessFlow, "x_t");
+        auto fXc = netFlow->getSessionInput(sessFlow, "x_cond");
+        auto fT = netFlow->getSessionInput(sessFlow, "t");
+        auto fS = netFlow->getSessionInput(sessFlow, "s");
+        auto fOut = netFlow->getSessionOutput(sessFlow, "output");
 
-        std::shared_ptr<Tensor> hostS(new Tensor(flowS, Tensor::CAFFE));
-        hostS->host<int>()[0] = styleIndex;
-        flowS->copyFromHostTensor(hostS.get());
+        fXc->copyFromHostTensor(tEncOut);
 
-        float dt = 1.0f / (float)steps;
+        std::unique_ptr<Tensor> hS(new Tensor(fS, Tensor::CAFFE));
+        hS->host<int>()[0] = styleId;
+        fS->copyFromHostTensor(hS.get());
 
-        std::shared_ptr<Tensor> hostXt(new Tensor(flowXt, Tensor::CAFFE));
-        std::shared_ptr<Tensor> hostT(new Tensor(flowT, Tensor::CAFFE));
-        std::shared_ptr<Tensor> hostOut(new Tensor(flowOutput, Tensor::CAFFE));
+        std::unique_ptr<Tensor> latent(new Tensor(fXt, Tensor::CAFFE));
+        latent->copyFromHostTensor(tEncOut);
 
-        // 仅计算 Flow 网络本身的耗时，不包含数据搬运
-        float t_flow_net_only = 0;
+        for (int i = 0; i < 5; ++i) {
+            fXt->copyFromHostTensor(latent.get());
 
-        for (int i = 0; i < steps; i++) {
-            float t_curr = (float)i / steps;
+            std::unique_ptr<Tensor> hT(new Tensor(fT, Tensor::CAFFE));
+            hT->host<float>()[0] = mStepsT[i];
+            fT->copyFromHostTensor(hT.get());
 
-            ::memcpy(hostXt->host<float>(), latents.data(), latentSize * sizeof(float));
-            flowXt->copyFromHostTensor(hostXt.get());
-
-            hostT->host<float>()[0] = t_curr;
-            flowT->copyFromHostTensor(hostT.get());
-
-            Timer netTimer;
-            flowNet->runSession(flowSess);
-            t_flow_net_only += netTimer.elapsed();
-
-            flowOutput->copyToHostTensor(hostOut.get());
-            float* v_ptr = hostOut->host<float>();
-
-            for (int j = 0; j < latentSize; j++) {
-                latents[j] = latents[j] + v_ptr[j] * dt;
-            }
-        }
-        float t_flow_total = stepTimer.elapsed();
-        stepTimer.reset();
-
-        // --- 3. Decoder ---
-        std::shared_ptr<Tensor> hostDecIn(new Tensor(decInput, Tensor::CAFFE));
-        ::memcpy(hostDecIn->host<float>(), latents.data(), latentSize * sizeof(float));
-        decInput->copyFromHostTensor(hostDecIn.get());
-
-        decNet->runSession(decSess);
-        float t_dec = stepTimer.elapsed();
-        stepTimer.reset();
-
-        // --- 4. Post Process ---
-        AndroidBitmap_lockPixels(env, outputBitmap, &pixels);
-
-        std::shared_ptr<Tensor> finalOut(Tensor::create<float>({1, 512, 512, 3}, nullptr, Tensor::TENSORFLOW));
-        decOutput->copyToHostTensor(finalOut.get());
-
-        float* outData = finalOut->host<float>();
-        uint8_t* bmpData = (uint8_t*)pixels;
-        int pixelCount = 512 * 512;
-
-        for (int i = 0; i < pixelCount; i++) {
-            float r = outData[i * 3 + 0];
-            float g = outData[i * 3 + 1];
-            float b = outData[i * 3 + 2];
-
-            int R = (int)(r * 255.0f);
-            int G = (int)(g * 255.0f);
-            int B = (int)(b * 255.0f);
-
-            bmpData[i * 4 + 0] = (uint8_t)(std::max(0, std::min(255, R)));
-            bmpData[i * 4 + 1] = (uint8_t)(std::max(0, std::min(255, G)));
-            bmpData[i * 4 + 2] = (uint8_t)(std::max(0, std::min(255, B)));
-            bmpData[i * 4 + 3] = 255;
+            netFlow->runSession(sessFlow);
+            fOut->copyToHostTensor(latent.get());
         }
 
-        AndroidBitmap_unlockPixels(env, outputBitmap);
-        float t_post = stepTimer.elapsed();
+        // --- STEP 3: DECODER ---
+        auto dIn = netDec->getSessionInput(sessDec, "input");
+        dIn->copyFromHostTensor(latent.get());
+        netDec->runSession(sessDec);
+        auto dOut = netDec->getSessionOutput(sessDec, "output");
 
-        LOGI("--- 性能统计 (Steps=%d) ---", steps);
-        LOGI("1. Encoder     : %.2f ms", t_enc);
-        LOGI("2. Flow Loop   : %.2f ms (NetOnly: %.2f ms)", t_flow_total, t_flow_net_only);
-        LOGI("3. Decoder     : %.2f ms", t_dec);
-        LOGI("4. PostProcess : %.2f ms", t_post);
-        LOGI("Total Time     : %.2f ms", totalTimer.elapsed());
-        LOGI("--------------------------");
+        // --- STEP 4: RESULT RENDER ---
+        AndroidBitmap_lockPixels(env, outBmp, &pixels);
+        std::unique_ptr<Tensor> hFinal(new Tensor(dOut, Tensor::CAFFE));
+        dOut->copyToHostTensor(hFinal.get());
 
+        float* data = hFinal->host<float>();
+        uint8_t* rgba = (uint8_t*)pixels;
+        for (int i = 0; i < 512 * 512; i++) {
+            rgba[i * 4 + 0] = (uint8_t)std::clamp(data[i] * 255.0f, 0.0f, 255.0f);
+            rgba[i * 4 + 1] = (uint8_t)std::clamp(data[i + 262144] * 255.0f, 0.0f, 255.0f);
+            rgba[i * 4 + 2] = (uint8_t)std::clamp(data[i + 524288] * 255.0f, 0.0f, 255.0f);
+            rgba[i * 4 + 3] = 255;
+        }
+        AndroidBitmap_unlockPixels(env, outBmp);
+
+        auto end_time = std::chrono::high_resolution_clock::now();
+        float ms = std::chrono::duration<float, std::milli>(end_time - t_start).count();
+        LOGI(">>> CPU SUCCESS! Inference Time: %.2f ms", ms);
         return true;
-    }
-
-private:
-    bool loadModel(const std::string& path, std::shared_ptr<Interpreter>& net, Session*& sess, const char* name) {
-        LOGI("[%s] 加载中: %s", name, path.c_str());
-        std::ifstream f(path);
-        if (!f.good()) { LOGE("[%s] 文件缺失!", name); return false; }
-
-        net = std::shared_ptr<Interpreter>(Interpreter::createFromFile(path.c_str()));
-        if (!net) return false;
-
-        ScheduleConfig config;
-        config.type = MNN_FORWARD_OPENCL; // 指定设备
-        config.mode = MNN_GPU_TUNING_WIDE | MNN_GPU_MEMORY_BUFFER;
-        config.numThread = 4;
-
-        BackendConfig backendConfig;
-        backendConfig.precision = BackendConfig::Precision_Low; // 指定精度
-        config.backendConfig = &backendConfig;
-
-        sess = net->createSession(config);
-        return (sess != nullptr);
     }
 };
 
-static SAFlowPipeline* g_pipeline = nullptr;
+static SAFlowEngine* g_engine = nullptr;
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_example_mnn_MainActivity_initEngine(JNIEnv* env, jobject thiz, jstring jCacheDir) {
     const char* path = env->GetStringUTFChars(jCacheDir, nullptr);
-    std::string cacheDirStr = path;
-    g_LogFilePath = cacheDirStr + "/native_debug.txt";
-
-    if (g_pipeline) { delete g_pipeline; g_pipeline = nullptr; }
-
-    try {
-        g_pipeline = new SAFlowPipeline(cacheDirStr);
-        if (g_pipeline->isValid()) {
-            env->ReleaseStringUTFChars(jCacheDir, path);
-            return JNI_TRUE;
-        }
-    } catch (...) {}
-
+    if (g_engine) { delete g_engine; g_engine = nullptr; }
+    g_engine = new SAFlowEngine(path);
     env->ReleaseStringUTFChars(jCacheDir, path);
-    return JNI_FALSE;
+    return JNI_TRUE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_example_mnn_MainActivity_runStyleTransfer(
-        JNIEnv* env, jobject thiz, jobject inputBitmap, jobject outputBitmap, jint styleIndex) {
-    if (!g_pipeline) return false;
-    return g_pipeline->run(env, inputBitmap, outputBitmap, styleIndex, 15);
+Java_com_example_mnn_MainActivity_runStyleTransfer(JNIEnv* env, jobject thiz, jobject src, jobject dst, jint styleId) {
+    if (!g_engine) return JNI_FALSE;
+    return g_engine->run(env, src, dst, (int)styleId);
 }
