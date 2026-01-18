@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.sdapp"
+    namespace = "com.example.mnn"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.example.sdapp"
+        applicationId = "com.example.mnn"
         // 维持 26 以解决 adaptive-icon 报错
         minSdk = 26
         targetSdk = 35
@@ -62,7 +62,7 @@ android {
         jniLibs {
             // 1. 解决 16KB Page Size 设备安装报错 (强制压缩 .so)
             // 注意：Kotlin DSL 必须带等号
-            useLegacyPackaging = true
+            useLegacyPackaging = false
 
             // 2. 解决 .so 重复冲突
             pickFirsts.add("lib/arm64-v8a/libc++_shared.so")

@@ -1,9 +1,8 @@
 package com.example.mnn
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.foundation.clickable // 确保 clickable 被引用
+
 import android.graphics.Bitmap
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -13,10 +12,10 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -28,166 +27,304 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
+import java.io.PrintWriter
+import java.io.StringWriter
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
+
+    external fun initEngine(cacheDir: String): Boolean
+    external fun runStyleTransfer(src: Bitmap, dst: Bitmap, styleId: Int): Boolean
+
+    private val logFile by lazy { File(cacheDir, "java_debug.txt") }
+    private val crashFile by lazy { File(cacheDir, "crash_log.txt") } // 专门记录闪退
     private val viewModel: MainViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // 【核武器】全局崩溃捕获器
+        // 只要 App 闪退，就会把错误堆栈写进 crash_log.txt
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            handleCrash(throwable)
+        }
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            safeLoadLibrariesAndModels()
+        }
+
         setContent {
             MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    StyleTransferScreen(viewModel)
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    StyleTransferScreen(
+                        viewModel = viewModel,
+                        onGenerate = { styleId -> runGeneration(styleId) }
+                    )
                 }
             }
         }
     }
+
+    // 处理崩溃：写入文件
+    private fun handleCrash(e: Throwable) {
+        try {
+            val sw = StringWriter()
+            val pw = PrintWriter(sw)
+            e.printStackTrace(pw)
+            val stackTrace = sw.toString()
+
+            val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+            val report = "\n[$time] CRASH REPORT:\n$stackTrace\n"
+
+            // 写入 crash_log.txt
+            FileOutputStream(crashFile, true).use {
+                it.write(report.toByteArray())
+            }
+
+            // 同时写入 debug log
+            writeLog("APP CRASHED! See crash_log.txt")
+        } catch (ex: Exception) {
+            // 既然都崩了，这里也没办法了
+        } finally {
+            // 必须杀掉进程，否则会黑屏卡死
+            android.os.Process.killProcess(android.os.Process.myPid())
+            System.exit(1)
+        }
+    }
+
+    private fun runGeneration(styleId: Int) {
+        val input = viewModel.uiState.value.originalBitmap ?: return
+        if (!viewModel.isEngineReady) {
+            viewModel.updateStatus("引擎未就绪")
+            return
+        }
+
+        viewModel.setProcessing(true)
+        viewModel.updateStatus("生成中 (OpenCL)...")
+
+        lifecycleScope.launch(Dispatchers.Default) {
+            try {
+                // 确保宽高一致，防止底层越界
+                val w = 512
+                val h = 512
+                val output = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+
+                // 双重检查 Bitmap 状态
+                if (input.isRecycled) throw RuntimeException("Input Bitmap is recycled!")
+                if (input.width != w || input.height != h) throw RuntimeException("Input size mismatch: ${input.width}x${input.height}")
+
+                val start = System.currentTimeMillis()
+                val success = runStyleTransfer(input, output, styleId)
+                val cost = System.currentTimeMillis() - start
+
+                withContext(Dispatchers.Main) {
+                    viewModel.setProcessing(false)
+                    if (success) {
+                        viewModel.setResult(output)
+                        viewModel.updateStatus("完成! 耗时: ${cost}ms")
+                    } else {
+                        viewModel.updateStatus("生成失败 (看日志)")
+                    }
+                }
+            } catch (e: Exception) {
+                // 这里捕获的是逻辑错误，Thread.setDefaultUncaughtExceptionHandler 捕获的是闪退
+                withContext(Dispatchers.Main) {
+                    viewModel.setProcessing(false)
+                    viewModel.updateStatus("Err: ${e.message}")
+                    writeLog("Logic Error: ${e.message}")
+                    // 如果是严重错误，手动触发记录
+                    handleCrash(e)
+                }
+            }
+        }
+    }
+
+    private suspend fun safeLoadLibrariesAndModels() {
+        writeLog("App Start")
+        try {
+            System.loadLibrary("c++_shared")
+            System.loadLibrary("MNN")
+            System.loadLibrary("sd_engine")
+
+            val modelFiles = listOf("Encoder.mnn", "Flow.mnn", "Decoder.mnn")
+            for (fileName in modelFiles) {
+                val outFile = File(cacheDir, fileName)
+                // 每次都覆盖拷贝，防止文件损坏
+                copyAssetResource(fileName, outFile)
+            }
+
+            val success = initEngine(cacheDir.absolutePath)
+            withContext(Dispatchers.Main) {
+                if (success) {
+                    viewModel.isEngineReady = true
+                    viewModel.updateStatus("引擎就绪 (Snapdragon 8 Elite)")
+                } else {
+                    viewModel.updateStatus("初始化失败")
+                }
+            }
+        } catch (e: Throwable) {
+            writeLog("Load Error: ${e.message}")
+            e.printStackTrace()
+        }
+    }
+
+    private fun writeLog(msg: String) {
+        try { FileOutputStream(logFile, true).use { it.write("[Java] $msg\n".toByteArray()) } } catch (e: Exception) {}
+    }
+
+    private fun copyAssetResource(assetName: String, outFile: File): Boolean {
+        return try {
+            assets.open(assetName).use { input -> FileOutputStream(outFile).use { output -> input.copyTo(output) } }
+            true
+        } catch (e: Exception) { false }
+    }
 }
 
+// ==========================================
+// UI 部分 (超级安全版)
+// ==========================================
+
 @Composable
-fun StyleTransferScreen(viewModel: MainViewModel) {
+fun StyleTransferScreen(
+    viewModel: MainViewModel,
+    onGenerate: (Int) -> Unit
+) {
     val uiState by viewModel.uiState.collectAsState()
 
-    // 图片选择器
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia(),
         onResult = { uri -> if (uri != null) viewModel.onImageSelected(uri) }
     )
 
-    // 风格选择状态 (0 或 1)
     var selectedStyleId by remember { mutableIntStateOf(0) }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp)
-            .verticalScroll(rememberScrollState()), // 允许滚动防止小屏遮挡
+    // 使用 LazyColumn 是解决滚动冲突的最佳方案
+    // 如果这里还崩，说明是 Compose 版本或系统兼容性的大问题
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(16.dp), // 简单的 Padding，不依赖 systemBars
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // 1. 标题与状态
-        Text("MNN Style Transfer", fontSize = 24.sp, fontWeight = FontWeight.Bold)
-        Text("Snapdragon 8 Elite Edition", fontSize = 12.sp, color = Color.Gray)
-        Spacer(modifier = Modifier.height(8.dp))
+        // 顶部留白适配状态栏 (粗暴但有效)
+        item { Spacer(modifier = Modifier.height(40.dp)) }
 
-        // 状态条
-        Card(
-            colors = CardDefaults.cardColors(containerColor = if (uiState.isProcessing) Color(0xFFFFF3E0) else Color(0xFFE8F5E9)),
-            modifier = Modifier.fillMaxWidth()
-        ) {
+        item {
+            Text("MNN Style Transfer", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            Text("Adreno GPU (OpenCL)", fontSize = 12.sp, color = Color.Gray)
+            Spacer(modifier = Modifier.height(12.dp))
+        }
+
+        item {
             Text(
                 text = uiState.statusMessage,
-                modifier = Modifier.padding(12.dp),
-                fontSize = 14.sp
+                fontSize = 14.sp,
+                color = if (uiState.isProcessing) Color.Red else Color.Black,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFFF5F5F5), RoundedCornerShape(8.dp))
+                    .padding(10.dp)
             )
+            Spacer(modifier = Modifier.height(20.dp))
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // 2. 图片展示区 (原图 vs 结果)
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceEvenly
-        ) {
-            // 原图卡片
-            ImageCard("原图 (Input)", uiState.originalBitmap) {
-                // 点击原图位置也可以触发选择
+        item {
+            Text("Input (Original)", fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.height(8.dp))
+            BigImageCard(uiState.originalBitmap) {
                 photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
             }
-
-            // 结果图卡片
-            ImageCard("结果 (Output)", uiState.resultBitmap) {
-                // 点击结果图可以是保存或者是大图预览（暂空）
-            }
+            Spacer(modifier = Modifier.height(20.dp))
         }
 
-        Spacer(modifier = Modifier.height(24.dp))
-
-        // 3. 风格选择器
-        Text("选择目标风格 (Parameter S)", fontWeight = FontWeight.SemiBold)
-        Spacer(modifier = Modifier.height(8.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            StyleOption(id = 0, name = "Style A (梵高风)", selectedId = selectedStyleId) { selectedStyleId = 0 }
-            StyleOption(id = 1, name = "Style B (油画风)", selectedId = selectedStyleId) { selectedStyleId = 1 }
+        item {
+            Text("Output (Result)", fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.height(8.dp))
+            BigImageCard(uiState.resultBitmap) { }
+            Spacer(modifier = Modifier.height(24.dp))
         }
 
-        Spacer(modifier = Modifier.height(32.dp))
-
-        // 4. 操作按钮
-        if (uiState.originalBitmap == null) {
-            Button(
-                onClick = { photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
-                modifier = Modifier.fillMaxWidth().height(50.dp)
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly
             ) {
-                Text("上传图片")
+                Button(
+                    onClick = { selectedStyleId = 0 },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (selectedStyleId == 0) MaterialTheme.colorScheme.primary else Color.LightGray
+                    )
+                ) { Text("Style A") }
+
+                Button(
+                    onClick = { selectedStyleId = 1 },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (selectedStyleId == 1) MaterialTheme.colorScheme.primary else Color.LightGray
+                    )
+                ) { Text("Style B") }
             }
-        } else {
+            Spacer(modifier = Modifier.height(24.dp))
+        }
+
+        item {
             Button(
-                onClick = { viewModel.generate(selectedStyleId) },
-                enabled = !uiState.isProcessing, // 处理中禁用
-                modifier = Modifier.fillMaxWidth().height(50.dp)
+                onClick = {
+                    if (uiState.originalBitmap == null) {
+                        photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                    } else {
+                        onGenerate(selectedStyleId)
+                    }
+                },
+                enabled = !uiState.isProcessing,
+                modifier = Modifier.fillMaxWidth().height(56.dp)
             ) {
                 if (uiState.isProcessing) {
-                    CircularProgressIndicator(modifier = Modifier.size(24.dp), color = Color.White)
+                    CircularProgressIndicator(color = Color.White, modifier = Modifier.size(24.dp))
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("生成中...")
+                    Text("Generating...")
                 } else {
-                    Text("开始转换 (Start)")
+                    Text(if (uiState.originalBitmap == null) "Select Image" else "Start Generate")
                 }
             }
+            Spacer(modifier = Modifier.height(100.dp)) // 底部超大留白，防止到底部闪退
         }
     }
 }
 
-// 组件：单个图片展示卡片
 @Composable
-fun ImageCard(title: String, bitmap: Bitmap?, onClick: () -> Unit) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Box(
-            modifier = Modifier
-                .size(160.dp) // 160dp 正方形
-                .clip(RoundedCornerShape(12.dp))
-                .background(Color.LightGray)
-                .border(1.dp, Color.Gray, RoundedCornerShape(12.dp))
-                .noRippleClickable(onClick), // 自定义点击事件
-            contentAlignment = Alignment.Center
-        ) {
-            if (bitmap != null) {
-                Image(
-                    bitmap = bitmap.asImageBitmap(),
-                    contentDescription = null,
-                    modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Crop
-                )
-            } else {
-                Text("waiting...", color = Color.DarkGray, fontSize = 12.sp)
+fun BigImageCard(bitmap: Bitmap?, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .aspectRatio(1f)
+            .clip(RoundedCornerShape(12.dp))
+            .background(Color.LightGray)
+            .border(1.dp, Color.Gray, RoundedCornerShape(12.dp))
+            .clickable { onClick() },
+        contentAlignment = Alignment.Center
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.FillBounds
+            )
+        } else {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("Tap to Select", color = Color.White, fontWeight = FontWeight.Bold)
+                Text("512 x 512", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
             }
         }
-        Spacer(modifier = Modifier.height(4.dp))
-        Text(title, fontSize = 14.sp)
     }
 }
-
-// 组件：风格单选按钮
-@Composable
-fun StyleOption(id: Int, name: String, selectedId: Int, onClick: () -> Unit) {
-    FilterChip(
-        selected = (id == selectedId),
-        onClick = onClick,
-        label = { Text(name) },
-        leadingIcon = {
-            if (id == selectedId) {
-                Icon(
-                    androidx.compose.material.icons.Icons.Filled.Check,
-                    contentDescription = null,
-                    modifier = Modifier.size(18.dp)
-                )
-            }
-        }
-    )
-}
-
-// 辅助：去除点击波纹的修饰符（为了代码简洁，这里做个简版）
-// 实际可以直接用 clickable
-fun Modifier.noRippleClickable(onClick: () -> Unit): Modifier = this.then(
-    Modifier.clickable { onClick() }
-)

@@ -23,7 +23,6 @@ target_include_directories(sd_engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
 # 链接
 target_link_libraries(sd_engine
         MNN_Express
-        MNN_LLM
         MNN
         log
         jnigraphics
